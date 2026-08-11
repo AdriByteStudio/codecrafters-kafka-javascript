@@ -535,6 +535,23 @@ const getValidIotProduceResponse = (topicName, partitionIndex) => {
   };
 };
 
+const appendProduceRecordBatchToDisk = (topicName, partitionIndex, recordBatchBytes) => {
+  if (!recordBatchBytes || recordBatchBytes.length === 0) {
+    return null;
+  }
+
+  for (const logDir of getLogDirectories()) {
+    const topicDir = path.join(logDir, `${topicName}-${partitionIndex}`);
+    fs.mkdirSync(topicDir, { recursive: true });
+    const logPath = path.join(topicDir, "00000000000000000000.log");
+    const existing = fs.existsSync(logPath) ? fs.readFileSync(logPath) : Buffer.alloc(0);
+    fs.writeFileSync(logPath, Buffer.concat([existing, recordBatchBytes]));
+    return logPath;
+  }
+
+  return null;
+};
+
 const parseProduceRequest = (request, offset) => {
   let cursor = offset;
 
@@ -552,6 +569,7 @@ const parseProduceRequest = (request, offset) => {
   const topicCount = topicsArrayLength === 0 ? 0 : topicsArrayLength - 1;
   let topicName = "";
   let partitionIndex = -1;
+  let recordBatchBytes = Buffer.alloc(0);
 
   for (let i = 0; i < topicCount; i += 1) {
     const { value: currentTopicName, offset: afterTopicName } = readCompactString(request, cursor);
@@ -568,7 +586,10 @@ const parseProduceRequest = (request, offset) => {
 
       const { value: recordBatchesSize, bytesRead: recordBatchesSizeBytes } = readUnsignedVarint(request, cursor);
       cursor += recordBatchesSizeBytes;
-      cursor += recordBatchesSize;
+
+      const actualRecordBatchBytesLength = Math.max(0, Number(recordBatchesSize) - 1);
+      recordBatchBytes = request.subarray(cursor, cursor + actualRecordBatchBytesLength);
+      cursor += actualRecordBatchBytesLength;
 
       if (cursor < request.length) {
         const { value: tag, bytesRead } = readUnsignedVarint(request, cursor);
@@ -593,7 +614,7 @@ const parseProduceRequest = (request, offset) => {
     }
   }
 
-  return { topicName, partitionIndex, offset: cursor, transactionalId, acks };
+  return { topicName, partitionIndex, recordBatchBytes, offset: cursor, transactionalId, acks };
 };
 
 const parseFetchRequest = (request, offset) => {
@@ -732,8 +753,12 @@ const server = net.createServer((connection) => {
       let responseBody;
 
       if (requestApiKey === 0) {
-        const { topicName, partitionIndex } = parseProduceRequest(request, offset);
+        const { topicName, partitionIndex, recordBatchBytes } = parseProduceRequest(request, offset);
         const validProduceResponse = getValidIotProduceResponse(topicName, partitionIndex);
+
+        if (validProduceResponse) {
+          appendProduceRecordBatchToDisk(topicName, partitionIndex, recordBatchBytes);
+        }
 
         const errorCode = validProduceResponse ? 0 : 3;
         const baseOffset = validProduceResponse ? 0 : -1;
