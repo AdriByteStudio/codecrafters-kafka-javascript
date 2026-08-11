@@ -106,17 +106,20 @@ const server = net.createServer((connection) => {
 
       if (requestApiKey === 18) {
         console.error("API_VERSIONS_REQUEST", { requestApiVersion, requestLength: request.length, requestHex: request.toString("hex") });
+
         const errorCode = requestApiVersion >= 0 && requestApiVersion <= 4 ? 0 : 35;
         const apiKeys = [
           [18, 0, 4],
           [75, 0, 0],
         ];
+
         const apiKeysArrayLengthBuffer = writeUnsignedVarint(apiKeys.length + 1);
         const apiKeyEntries = Buffer.concat(
           apiKeys.map(([apiKey, minVersion, maxVersion]) => Buffer.concat([
             writeInt16(apiKey),
             writeInt16(minVersion),
             writeInt16(maxVersion),
+            writeUnsignedVarint(0),
           ])),
         );
 
