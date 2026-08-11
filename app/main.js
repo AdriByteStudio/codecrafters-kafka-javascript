@@ -286,7 +286,15 @@ const server = net.createServer((connection) => {
 
       let responseBody;
 
-      if (requestApiKey === 18) {
+      if (requestApiKey === 1) {
+        responseBody = Buffer.concat([
+          writeInt32(0),
+          writeInt16(0),
+          writeInt32(0),
+          writeUnsignedVarint(1),
+          writeUnsignedVarint(0),
+        ]);
+      } else if (requestApiKey === 18) {
         console.error("API_VERSIONS_REQUEST", { requestApiVersion, requestLength: request.length, requestHex: request.toString("hex") });
 
         const errorCode = requestApiVersion >= 0 && requestApiVersion <= 4 ? 0 : 35;
@@ -369,7 +377,7 @@ const server = net.createServer((connection) => {
         responseBody = Buffer.alloc(0);
       }
 
-      const responseHeader = requestApiKey === 75
+      const responseHeader = [1, 75].includes(requestApiKey)
         ? Buffer.concat([writeInt32(correlationId), writeUnsignedVarint(0)])
         : writeInt32(correlationId);
 
