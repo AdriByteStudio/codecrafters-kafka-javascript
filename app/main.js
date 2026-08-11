@@ -291,6 +291,7 @@ const server = net.createServer((connection) => {
 
         const errorCode = requestApiVersion >= 0 && requestApiVersion <= 4 ? 0 : 35;
         const apiKeys = [
+          [1, 0, 16],
           [18, 0, 4],
           [75, 0, 0],
         ];
