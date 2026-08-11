@@ -567,29 +567,31 @@ const parseProduceRequest = (request, offset) => {
   cursor += topicsArrayBytesRead;
 
   const topicCount = topicsArrayLength === 0 ? 0 : topicsArrayLength - 1;
-  let topicName = "";
-  let partitionIndex = -1;
-  let recordBatchBytes = Buffer.alloc(0);
+  const topicPartitions = [];
 
   for (let i = 0; i < topicCount; i += 1) {
     const { value: currentTopicName, offset: afterTopicName } = readCompactString(request, cursor);
     cursor = afterTopicName;
-    topicName = currentTopicName ?? "";
+    const topicName = currentTopicName ?? "";
 
     const { value: partitionsArrayLength, bytesRead: partitionsArrayBytesRead } = readUnsignedVarint(request, cursor);
     cursor += partitionsArrayBytesRead;
 
     const partitionCount = partitionsArrayLength === 0 ? 0 : partitionsArrayLength - 1;
+    const partitions = [];
+
     for (let j = 0; j < partitionCount; j += 1) {
-      partitionIndex = request.readInt32BE(cursor);
+      const partitionIndex = request.readInt32BE(cursor);
       cursor += 4;
 
       const { value: recordBatchesSize, bytesRead: recordBatchesSizeBytes } = readUnsignedVarint(request, cursor);
       cursor += recordBatchesSizeBytes;
 
       const actualRecordBatchBytesLength = Math.max(0, Number(recordBatchesSize) - 1);
-      recordBatchBytes = request.subarray(cursor, cursor + actualRecordBatchBytesLength);
+      const recordBatchBytes = request.subarray(cursor, cursor + actualRecordBatchBytesLength);
       cursor += actualRecordBatchBytesLength;
+
+      partitions.push({ partitionIndex, recordBatchBytes });
 
       if (cursor < request.length) {
         const { value: tag, bytesRead } = readUnsignedVarint(request, cursor);
@@ -598,6 +600,8 @@ const parseProduceRequest = (request, offset) => {
         }
       }
     }
+
+    topicPartitions.push({ topicName, partitions });
 
     if (cursor < request.length) {
       const { value: tag, bytesRead } = readUnsignedVarint(request, cursor);
@@ -614,7 +618,7 @@ const parseProduceRequest = (request, offset) => {
     }
   }
 
-  return { topicName, partitionIndex, recordBatchBytes, offset: cursor, transactionalId, acks };
+  return { topicPartitions, offset: cursor, transactionalId, acks };
 };
 
 const parseFetchRequest = (request, offset) => {
@@ -753,38 +757,61 @@ const server = net.createServer((connection) => {
       let responseBody;
 
       if (requestApiKey === 0) {
-        const { topicName, partitionIndex, recordBatchBytes } = parseProduceRequest(request, offset);
-        const validProduceResponse = getValidIotProduceResponse(topicName, partitionIndex);
+        const { topicPartitions } = parseProduceRequest(request, offset);
 
-        if (validProduceResponse) {
-          appendProduceRecordBatchToDisk(topicName, partitionIndex, recordBatchBytes);
-        }
+        const topicResponses = topicPartitions.map(({ topicName, partitions }) => {
+          const validPartitions = partitions.filter(({ partitionIndex }) => getValidIotProduceResponse(topicName, partitionIndex));
 
-        const errorCode = validProduceResponse ? 0 : 3;
-        const baseOffset = validProduceResponse ? 0 : -1;
-        const logAppendTimeMs = validProduceResponse ? -1 : -1;
-        const logStartOffset = validProduceResponse ? 0 : -1;
-        const validPartitionIndex = validProduceResponse ? validProduceResponse.partitionIndex : partitionIndex;
+          if (validPartitions.length === 0) {
+            const firstPartition = partitions[0] || { partitionIndex: -1, recordBatchBytes: Buffer.alloc(0) };
+            const partitionResponse = Buffer.concat([
+              writeInt32(firstPartition.partitionIndex),
+              writeInt16(3),
+              writeInt64(-1),
+              writeInt64(-1),
+              writeInt64(-1),
+              writeUnsignedVarint(1),
+              writeUnsignedVarint(0),
+              writeUnsignedVarint(0),
+            ]);
 
-        const topicResponse = Buffer.concat([
-          writeCompactString(topicName || ""),
-          writeUnsignedVarint(2),
-          Buffer.concat([
-            writeInt32(validPartitionIndex),
-            writeInt16(errorCode),
-            writeInt64(baseOffset),
-            writeInt64(logAppendTimeMs),
-            writeInt64(logStartOffset),
-            writeUnsignedVarint(1),
+            return Buffer.concat([
+              writeCompactString(topicName || ""),
+              writeUnsignedVarint(partitions.length === 0 ? 1 : partitions.length + 1),
+              partitionResponse,
+              writeUnsignedVarint(0),
+            ]);
+          }
+
+          const partitionResponses = partitions.map(({ partitionIndex, recordBatchBytes }) => {
+            const valid = getValidIotProduceResponse(topicName, partitionIndex);
+            if (valid) {
+              appendProduceRecordBatchToDisk(topicName, partitionIndex, recordBatchBytes);
+            }
+
+            return Buffer.concat([
+              writeInt32(partitionIndex),
+              writeInt16(valid ? 0 : 3),
+              writeInt64(valid ? 0 : -1),
+              writeInt64(-1),
+              writeInt64(valid ? 0 : -1),
+              writeUnsignedVarint(1),
+              writeUnsignedVarint(0),
+              writeUnsignedVarint(0),
+            ]);
+          });
+
+          return Buffer.concat([
+            writeCompactString(topicName || ""),
+            writeUnsignedVarint(partitions.length === 0 ? 1 : partitions.length + 1),
+            ...partitionResponses,
             writeUnsignedVarint(0),
-            writeUnsignedVarint(0),
-          ]),
-          writeUnsignedVarint(0),
-        ]);
+          ]);
+        });
 
         responseBody = Buffer.concat([
-          writeUnsignedVarint(2),
-          topicResponse,
+          writeUnsignedVarint(topicResponses.length + 1),
+          ...topicResponses,
           writeInt32(0),
           writeUnsignedVarint(0),
         ]);
