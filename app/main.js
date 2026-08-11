@@ -1,4 +1,6 @@
+import fs from "fs";
 import net from "net";
+import path from "path";
 
 const writeInt16 = (value) => {
   const buffer = Buffer.alloc(2);
@@ -39,6 +41,9 @@ const writeCompactString = (value) => {
 };
 
 const writeBool = (value) => Buffer.from([value ? 1 : 0]);
+const writeInt8 = (value) => Buffer.from([value]);
+
+const writeUuid = (value) => Buffer.from(value.replace(/-/g, ""), "hex");
 
 const readUnsignedVarint = (buffer, offset) => {
   let value = 0;
@@ -76,6 +81,132 @@ const readCompactString = (buffer, offset) => {
   return { value: buffer.subarray(start, end).toString("utf8"), offset: end };
 };
 
+const decodeBase64Uuid = (value) => {
+  if (!value) {
+    return null;
+  }
+
+  const bytes = Buffer.from(value.trim(), "base64");
+  if (bytes.length !== 16) {
+    return null;
+  }
+
+  const hex = bytes.toString("hex");
+  return [
+    hex.slice(0, 8),
+    hex.slice(8, 12),
+    hex.slice(12, 16),
+    hex.slice(16, 20),
+    hex.slice(20),
+  ].join("-");
+};
+
+const getLogDirectories = () => {
+  const configPath = process.argv[2] || "/tmp/server.properties";
+  const fallback = ["/tmp/kraft-combined-logs", "/tmp/kraft-generated-logs"];
+
+  if (!fs.existsSync(configPath)) {
+    return fallback.filter((dir) => fs.existsSync(dir));
+  }
+
+  const config = fs.readFileSync(configPath, "utf8");
+  const logDirsLine = config
+    .split(/\r?\n/)
+    .find((line) => line.trim().startsWith("log.dirs="));
+
+  if (!logDirsLine) {
+    return fallback.filter((dir) => fs.existsSync(dir));
+  }
+
+  const rawValue = logDirsLine.split("=")[1].trim();
+  const dirs = rawValue.split(",").map((entry) => entry.trim()).filter(Boolean);
+  return dirs.length > 0 ? dirs : fallback.filter((dir) => fs.existsSync(dir));
+};
+
+const getTopicUuid = (topicName) => {
+  if (!topicName) {
+    return null;
+  }
+
+  for (const logDir of getLogDirectories()) {
+    if (!fs.existsSync(logDir)) {
+      continue;
+    }
+
+    const entries = fs.readdirSync(logDir, { withFileTypes: true });
+    const topicDir = entries.find((entry) => entry.isDirectory() && entry.name.startsWith(`${topicName}-`));
+    if (!topicDir) {
+      continue;
+    }
+
+    const metadataPath = path.join(logDir, topicDir.name, "partition.metadata");
+    if (!fs.existsSync(metadataPath)) {
+      continue;
+    }
+
+    const metadata = fs.readFileSync(metadataPath, "utf8");
+    const line = metadata
+      .split(/\r?\n/)
+      .find((entry) => entry.startsWith("topic_id:"));
+
+    if (!line) {
+      continue;
+    }
+
+    const value = line.slice("topic_id:".length).trim();
+    const uuid = decodeBase64Uuid(value);
+    if (uuid) {
+      return uuid;
+    }
+  }
+
+  return null;
+};
+
+const getTopicPartitions = (topicName) => {
+  if (!topicName) {
+    return [];
+  }
+
+  const partitions = [];
+  for (const logDir of getLogDirectories()) {
+    if (!fs.existsSync(logDir)) {
+      continue;
+    }
+
+    const entries = fs.readdirSync(logDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isDirectory() || !entry.name.startsWith(`${topicName}-`)) {
+        continue;
+      }
+
+      const match = entry.name.match(/-(\d+)$/);
+      if (!match) {
+        continue;
+      }
+
+      partitions.push(Number.parseInt(match[1], 10));
+    }
+  }
+
+  return partitions.sort((a, b) => a - b);
+};
+
+const encodePartition = (partitionIndex) => Buffer.concat([
+  writeInt16(0),
+  writeInt32(partitionIndex),
+  writeInt32(1),
+  writeInt32(0),
+  writeUnsignedVarint(2),
+  writeInt32(1),
+  writeUnsignedVarint(2),
+  writeInt32(1),
+  writeUnsignedVarint(1),
+  writeUnsignedVarint(1),
+  writeUnsignedVarint(1),
+  writeUnsignedVarint(0),
+]);
+
 const server = net.createServer((connection) => {
   let buffer = Buffer.alloc(0);
 
@@ -100,6 +231,13 @@ const server = net.createServer((connection) => {
         const clientIdLength = request.readInt16BE(offset);
         offset += 2;
         offset += clientIdLength;
+      }
+
+      if (offset < request.length) {
+        const { value: tag, bytesRead } = readUnsignedVarint(request, offset);
+        if (tag === 0) {
+          offset += bytesRead;
+        }
       }
 
       let responseBody;
@@ -141,7 +279,6 @@ const server = net.createServer((connection) => {
       } else if (requestApiKey === 75) {
         let topicName = "";
         if (offset < request.length) {
-          offset += 1;
           const { value: topicsArrayLength, bytesRead } = readUnsignedVarint(request, offset);
           offset += bytesRead;
           if (topicsArrayLength > 0 && offset < request.length) {
@@ -150,27 +287,49 @@ const server = net.createServer((connection) => {
           }
         }
 
+        console.error("DTP_DEBUG", { requestHex: request.toString("hex"), offset, topicName, topicUuidValue: getTopicUuid(topicName) });
+
+        const topicUuidValue = getTopicUuid(topicName);
+        const topicUuid = topicUuidValue ? writeUuid(topicUuidValue) : Buffer.alloc(16);
+        const topicErrorCode = topicUuidValue ? 0 : 3;
+        const partitions = getTopicPartitions(topicName);
+
+        const partitionResponses = partitions.map((partitionIndex) => Buffer.concat([
+          writeInt16(0),
+          writeInt32(partitionIndex),
+          writeInt32(1),
+          writeInt32(0),
+          writeUnsignedVarint(2),
+          writeInt32(1),
+          writeUnsignedVarint(2),
+          writeInt32(1),
+          writeUnsignedVarint(1),
+          writeUnsignedVarint(1),
+          writeUnsignedVarint(1),
+          writeUnsignedVarint(0),
+        ]));
+
         responseBody = Buffer.concat([
           writeInt32(0),
-          writeUnsignedVarint(3),
           writeUnsignedVarint(2),
-          writeInt16(3),
+          writeInt16(topicErrorCode),
           writeCompactString(topicName),
-          Buffer.alloc(16),
+          topicUuid,
           writeBool(false),
+          writeUnsignedVarint(partitions.length === 0 ? 1 : partitions.length + 1),
+          ...partitionResponses,
+          writeInt32(3576),
           writeUnsignedVarint(0),
-          writeInt32(-2147483648),
-          writeUnsignedVarint(0),
-          Buffer.from([0xff]),
-          writeUnsignedVarint(0),
+          writeInt8(-1),
           writeUnsignedVarint(0),
         ]);
       } else {
         responseBody = Buffer.alloc(0);
       }
 
-      const responseHeader = Buffer.alloc(4);
-      responseHeader.writeInt32BE(correlationId, 0);
+      const responseHeader = requestApiKey === 75
+        ? Buffer.concat([writeInt32(correlationId), writeUnsignedVarint(0)])
+        : writeInt32(correlationId);
 
       const response = Buffer.alloc(4 + responseHeader.length + responseBody.length);
       response.writeInt32BE(responseHeader.length + responseBody.length, 0);
