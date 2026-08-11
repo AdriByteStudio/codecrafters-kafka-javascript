@@ -42,6 +42,11 @@ const writeCompactString = (value) => {
 
 const writeBool = (value) => Buffer.from([value ? 1 : 0]);
 const writeInt8 = (value) => Buffer.from([value]);
+const writeInt64 = (value) => {
+  const buffer = Buffer.alloc(8);
+  buffer.writeBigInt64BE(BigInt(value), 0);
+  return buffer;
+};
 
 const writeUuid = (value) => Buffer.from(value.replace(/-/g, ""), "hex");
 
@@ -207,6 +212,80 @@ const encodePartition = (partitionIndex) => Buffer.concat([
   writeUnsignedVarint(0),
 ]);
 
+const readUuid = (buffer, offset) => {
+  if (offset + 16 > buffer.length) {
+    return { value: null, offset };
+  }
+
+  const raw = buffer.subarray(offset, offset + 16);
+  const hex = raw.toString("hex");
+  const uuid = [
+    hex.slice(0, 8),
+    hex.slice(8, 12),
+    hex.slice(12, 16),
+    hex.slice(16, 20),
+    hex.slice(20),
+  ].join("-");
+
+  return { value: uuid, offset: offset + 16 };
+};
+
+const parseFetchRequest = (request, offset) => {
+  let cursor = offset;
+
+  cursor += 4;
+  cursor += 4;
+  cursor += 4;
+  cursor += 1;
+  cursor += 4;
+  cursor += 4;
+
+  const { value: topicsArrayLength, bytesRead: topicsArrayBytesRead } = readUnsignedVarint(request, cursor);
+  cursor += topicsArrayBytesRead;
+
+  const topics = [];
+  const topicCount = topicsArrayLength === 0 ? 0 : topicsArrayLength - 1;
+
+  for (let i = 0; i < topicCount; i += 1) {
+    const { value: topicUuid, offset: uuidOffset } = readUuid(request, cursor);
+    cursor = uuidOffset;
+
+    const { value: partitionsArrayLength, bytesRead: partitionsArrayBytesRead } = readUnsignedVarint(request, cursor);
+    cursor += partitionsArrayBytesRead;
+
+    const partitionCount = partitionsArrayLength === 0 ? 0 : partitionsArrayLength - 1;
+    let partitionId = 0;
+
+    for (let j = 0; j < partitionCount; j += 1) {
+      partitionId = request.readInt32BE(cursor);
+      cursor += 4;
+      cursor += 4;
+      cursor += 8;
+      cursor += 4;
+      cursor += 8;
+      cursor += 4;
+
+      if (cursor < request.length) {
+        const { value: tag, bytesRead } = readUnsignedVarint(request, cursor);
+        if (tag === 0) {
+          cursor += bytesRead;
+        }
+      }
+    }
+
+    if (cursor < request.length) {
+      const { value: tag, bytesRead } = readUnsignedVarint(request, cursor);
+      if (tag === 0) {
+        cursor += bytesRead;
+      }
+    }
+
+    topics.push({ topicUuid, partitionId });
+  }
+
+  return { topics, offset: cursor };
+};
+
 const parseDescribeTopicPartitionsRequest = (request, offset) => {
   const topicNames = [];
 
@@ -287,13 +366,41 @@ const server = net.createServer((connection) => {
       let responseBody;
 
       if (requestApiKey === 1) {
-        responseBody = Buffer.concat([
-          writeInt32(0),
-          writeInt16(0),
-          writeInt32(0),
-          writeUnsignedVarint(1),
-          writeUnsignedVarint(0),
-        ]);
+        const { topics } = parseFetchRequest(request, offset);
+
+        if (topics.length === 0) {
+          responseBody = Buffer.concat([
+            writeInt32(0),
+            writeInt16(0),
+            writeInt32(0),
+            writeUnsignedVarint(1),
+            writeUnsignedVarint(0),
+          ]);
+        } else {
+          const firstTopic = topics[0];
+          const topicUuid = firstTopic.topicUuid || "00000000-0000-0000-0000-000000000000";
+          const partitionId = firstTopic.partitionId ?? 0;
+
+          responseBody = Buffer.concat([
+            writeInt32(0),
+            writeInt16(0),
+            writeInt32(0),
+            writeUnsignedVarint(2),
+            writeUuid(topicUuid),
+            writeUnsignedVarint(2),
+            writeInt32(partitionId),
+            writeInt16(100),
+            writeInt64(-1),
+            writeInt64(-1),
+            writeInt64(-1),
+            writeUnsignedVarint(1),
+            writeInt32(-1),
+            writeUnsignedVarint(1),
+            writeUnsignedVarint(0),
+            writeUnsignedVarint(0),
+            writeUnsignedVarint(0),
+          ]);
+        }
       } else if (requestApiKey === 18) {
         console.error("API_VERSIONS_REQUEST", { requestApiVersion, requestLength: request.length, requestHex: request.toString("hex") });
 
