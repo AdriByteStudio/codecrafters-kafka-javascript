@@ -232,6 +232,70 @@ const getTopicPartitions = (topicName) => {
   return partitions.sort((a, b) => a - b);
 };
 
+const getTopicLogPathByUuid = (topicUuid, partitionIndex) => {
+  if (!topicUuid) {
+    return null;
+  }
+
+  for (const logDir of getLogDirectories()) {
+    if (!fs.existsSync(logDir)) {
+      continue;
+    }
+
+    const entries = fs.readdirSync(logDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isDirectory()) {
+        continue;
+      }
+
+      const metadataPath = path.join(logDir, entry.name, "partition.metadata");
+      if (!fs.existsSync(metadataPath)) {
+        continue;
+      }
+
+      const metadata = fs.readFileSync(metadataPath, "utf8");
+      const line = metadata
+        .split(/\r?\n/)
+        .find((entryLine) => entryLine.startsWith("topic_id:"));
+
+      if (!line) {
+        continue;
+      }
+
+      const uuid = decodeBase64Uuid(line.slice("topic_id:".length).trim());
+      if (uuid !== topicUuid) {
+        continue;
+      }
+
+      const topicDir = path.join(logDir, entry.name);
+      const candidateFiles = fs.readdirSync(topicDir)
+        .filter((fileName) => fileName.endsWith(".log"))
+        .sort();
+
+      const desiredName = `${String(partitionIndex).padStart(20, "0")}.log`;
+      const exactMatch = candidateFiles.find((fileName) => fileName === desiredName)
+        || candidateFiles.find((fileName) => fileName.replace(/\.log$/, "") === String(partitionIndex))
+        || candidateFiles.find((fileName) => fileName.replace(/\.log$/, "").endsWith(String(partitionIndex)))
+        || candidateFiles[0];
+
+      if (exactMatch) {
+        return path.join(topicDir, exactMatch);
+      }
+    }
+  }
+
+  return null;
+};
+
+const readRecordBatchBytesForPartition = (topicUuid, partitionIndex) => {
+  const logPath = getTopicLogPathByUuid(topicUuid, partitionIndex);
+  if (!logPath || !fs.existsSync(logPath)) {
+    return Buffer.alloc(0);
+  }
+
+  return fs.readFileSync(logPath);
+};
+
 const encodePartition = (partitionIndex) => Buffer.concat([
   writeInt16(0),
   writeInt32(partitionIndex),
@@ -416,6 +480,7 @@ const server = net.createServer((connection) => {
           const topicResponses = topics.map(({ topicUuid, partitionId }) => {
             const uuid = topicUuid || "00000000-0000-0000-0000-000000000000";
             const partitionErrorCode = knownTopicUuids.has(uuid) ? 0 : 100;
+            const recordBatchBytes = readRecordBatchBytesForPartition(uuid, partitionId ?? 0);
 
             return Buffer.concat([
               writeUuid(uuid),
@@ -427,7 +492,8 @@ const server = net.createServer((connection) => {
               writeInt64(-1),
               writeUnsignedVarint(1),
               writeInt32(-1),
-              writeUnsignedVarint(1),
+              writeUnsignedVarint(recordBatchBytes.length + 1),
+              recordBatchBytes,
               writeUnsignedVarint(0),
               writeUnsignedVarint(0),
             ]);
