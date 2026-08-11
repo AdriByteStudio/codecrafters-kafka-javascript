@@ -349,6 +349,192 @@ const readString = (buffer, offset) => {
   };
 };
 
+const skipCompactArrayOfInt32 = (buffer, offset) => {
+  const { value: length, bytesRead } = readUnsignedVarint(buffer, offset);
+  const count = length === 0 ? 0 : length - 1;
+  return offset + bytesRead + count * 4;
+};
+
+const parseClusterMetadataPayload = (payload) => {
+  if (payload.length < 3) {
+    return null;
+  }
+
+  const frameVersion = payload[0];
+  const type = payload[1];
+  const version = payload[2];
+  const rest = payload.subarray(3);
+  let cursor = 0;
+
+  if (type === 2) {
+    const { value: nameLength, bytesRead: nameLengthBytes } = readUnsignedVarint(rest, cursor);
+    cursor += nameLengthBytes;
+    const topicName = rest.subarray(cursor, cursor + nameLength - 1).toString("utf8");
+    cursor += nameLength - 1;
+    const { value: topicUuid, offset: uuidOffset } = readUuid(rest, cursor);
+    cursor = uuidOffset;
+    return {
+      type: "topic",
+      frameVersion,
+      version,
+      name: topicName,
+      uuid: topicUuid,
+      cursor,
+    };
+  }
+
+  if (type === 3) {
+    const partitionId = rest.readInt32BE(cursor);
+    cursor += 4;
+    const { value: topicUuid, offset: topicUuidOffset } = readUuid(rest, cursor);
+    cursor = topicUuidOffset;
+    cursor = skipCompactArrayOfInt32(rest, cursor);
+    cursor = skipCompactArrayOfInt32(rest, cursor);
+    cursor = skipCompactArrayOfInt32(rest, cursor);
+    cursor = skipCompactArrayOfInt32(rest, cursor);
+    const leader = rest.readInt32BE(cursor);
+    cursor += 4;
+    const leaderEpoch = rest.readInt32BE(cursor);
+    cursor += 4;
+    const partitionEpoch = rest.readInt32BE(cursor);
+    cursor += 4;
+
+    const { value: directoryUuidCount, bytesRead: directoryUuidCountBytes } = readUnsignedVarint(rest, cursor);
+    cursor += directoryUuidCountBytes;
+    const directoryUuidCountValue = directoryUuidCount === 0 ? 0 : directoryUuidCount - 1;
+    const directoryUuids = [];
+    for (let i = 0; i < directoryUuidCountValue; i += 1) {
+      const { value: directoryUuid } = readUuid(rest, cursor);
+      if (directoryUuid) {
+        directoryUuids.push(directoryUuid);
+      }
+      cursor += 16;
+    }
+
+    return {
+      type: "partition",
+      frameVersion,
+      version,
+      partitionId,
+      topicUuid,
+      leader,
+      leaderEpoch,
+      partitionEpoch,
+      directoryUuids,
+      cursor,
+    };
+  }
+
+  return null;
+};
+
+const parseClusterMetadataLogFile = (logPath) => {
+  if (!logPath || !fs.existsSync(logPath)) {
+    return { topicRecords: [], partitionRecords: [] };
+  }
+
+  const buffer = fs.readFileSync(logPath);
+  const topicRecords = [];
+  const partitionRecords = [];
+  let offset = 0;
+
+  while (offset + 21 <= buffer.length) {
+    const batchStart = offset;
+    offset += 8;
+    const batchLength = buffer.readInt32BE(offset);
+    offset += 4;
+    offset += 4;
+    offset += 1;
+    offset += 4;
+
+    const attributes = buffer.readInt16BE(offset);
+    offset += 2;
+    offset += 4;
+    offset += 8;
+    offset += 8;
+    offset += 8;
+    offset += 2;
+    offset += 4;
+    const recordsCount = buffer.readInt32BE(offset);
+    offset += 4;
+
+    for (let i = 0; i < recordsCount; i += 1) {
+      const { value: recordSize, bytesRead: recordSizeBytes } = readUnsignedVarint(buffer, offset);
+      offset += recordSizeBytes;
+      const recordEnd = offset + Number(recordSize);
+
+      offset += 1;
+      const { bytesRead: timestampDeltaBytes } = readUnsignedVarint(buffer, offset);
+      offset += timestampDeltaBytes;
+      const { bytesRead: offsetDeltaBytes } = readUnsignedVarint(buffer, offset);
+      offset += offsetDeltaBytes;
+
+      const { value: keyLength, bytesRead: keyLengthBytes } = readUnsignedVarint(buffer, offset);
+      offset += keyLengthBytes;
+      if (keyLength > 0) {
+        offset += keyLength;
+      }
+
+      const { value: valueLength, bytesRead: valueLengthBytes } = readUnsignedVarint(buffer, offset);
+      offset += valueLengthBytes;
+      if (valueLength > 0) {
+        const payload = buffer.subarray(offset, offset + valueLength);
+        const record = parseClusterMetadataPayload(payload);
+        if (record && record.type === "topic") {
+          topicRecords.push(record);
+        } else if (record && record.type === "partition") {
+          partitionRecords.push(record);
+        }
+        offset += valueLength;
+      }
+
+      const { value: headersLength, bytesRead: headersLengthBytes } = readUnsignedVarint(buffer, offset);
+      offset += headersLengthBytes;
+      if (headersLength > 0) {
+        for (let j = 0; j < headersLength; j += 1) {
+          const { value: headerKeyLength, bytesRead: headerKeyLengthBytes } = readUnsignedVarint(buffer, offset);
+          offset += headerKeyLengthBytes;
+          if (headerKeyLength > 0) {
+            offset += headerKeyLength;
+          }
+          const { value: headerValueLength, bytesRead: headerValueLengthBytes } = readUnsignedVarint(buffer, offset);
+          offset += headerValueLengthBytes;
+          if (headerValueLength > 0) {
+            offset += headerValueLength;
+          }
+        }
+      }
+
+      offset = recordEnd;
+    }
+
+    offset = batchStart + 8 + 4 + batchLength;
+  }
+
+  return { topicRecords, partitionRecords };
+};
+
+const getValidIotProduceResponse = (topicName, partitionIndex) => {
+  const topicUuid = getTopicUuid(topicName);
+  if (!topicUuid) {
+    return null;
+  }
+
+  const partitions = getTopicPartitions(topicName);
+  if (!partitions.includes(partitionIndex)) {
+    return null;
+  }
+
+  return {
+    topicName,
+    partitionIndex,
+    errorCode: 0,
+    baseOffset: 0,
+    logAppendTimeMs: -1,
+    logStartOffset: 0,
+  };
+};
+
 const parseProduceRequest = (request, offset) => {
   let cursor = offset;
 
@@ -547,16 +733,23 @@ const server = net.createServer((connection) => {
 
       if (requestApiKey === 0) {
         const { topicName, partitionIndex } = parseProduceRequest(request, offset);
+        const validProduceResponse = getValidIotProduceResponse(topicName, partitionIndex);
+
+        const errorCode = validProduceResponse ? 0 : 3;
+        const baseOffset = validProduceResponse ? 0 : -1;
+        const logAppendTimeMs = validProduceResponse ? -1 : -1;
+        const logStartOffset = validProduceResponse ? 0 : -1;
+        const validPartitionIndex = validProduceResponse ? validProduceResponse.partitionIndex : partitionIndex;
 
         const topicResponse = Buffer.concat([
           writeCompactString(topicName || ""),
           writeUnsignedVarint(2),
           Buffer.concat([
-            writeInt32(partitionIndex),
-            writeInt16(3),
-            writeInt64(-1),
-            writeInt64(-1),
-            writeInt64(-1),
+            writeInt32(validPartitionIndex),
+            writeInt16(errorCode),
+            writeInt64(baseOffset),
+            writeInt64(logAppendTimeMs),
+            writeInt64(logStartOffset),
             writeUnsignedVarint(1),
             writeUnsignedVarint(0),
             writeUnsignedVarint(0),
