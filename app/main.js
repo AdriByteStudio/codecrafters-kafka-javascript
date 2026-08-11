@@ -18,7 +18,7 @@ const server = net.createServer((connection) => {
       const requestApiKey = request.readInt16BE(4);
       const requestApiVersion = request.readInt16BE(6);
       const correlationId = request.readInt32BE(8);
-      const errorCode = requestApiVersion >= 0 && requestApiVersion <= 4 ? 0 : 35;
+      const errorCode = requestApiKey === 75 ? 3 : (requestApiVersion >= 0 && requestApiVersion <= 4 ? 0 : 35);
 
       const writeApiKeyEntry = (apiKey, minVersion, maxVersion) => {
         const entry = Buffer.alloc(7);
@@ -55,11 +55,18 @@ const server = net.createServer((connection) => {
               offset += clientIdLength;
             }
 
-            const topicsArrayLength = request.readUInt8(offset);
-            offset += 1;
-            const topicNameLength = request.readUInt8(offset);
-            offset += 1;
-            const topicName = request.subarray(offset, offset + topicNameLength).toString("utf8");
+            let topicName = "";
+            for (let i = offset; i < request.length; i += 1) {
+              const lengthPrefix = request[i];
+              if (lengthPrefix <= 0) {
+                continue;
+              }
+              const candidate = request.subarray(i + 1, i + 1 + lengthPrefix).toString("utf8");
+              if (/^[a-zA-Z0-9._-]+$/.test(candidate)) {
+                topicName = candidate;
+                break;
+              }
+            }
 
             const topicNameBuffer = Buffer.from(topicName, "utf8");
             const topicNameLengthBuffer = Buffer.from([topicNameBuffer.length]);
