@@ -21,7 +21,7 @@ const server = net.createServer((connection) => {
 
     const responseBody = Buffer.alloc(15);
     responseBody.writeInt16BE(errorCode, 0);
-    responseBody.writeInt8(1, 2);
+    responseBody.writeInt8(2, 2);
     responseBody.writeInt16BE(18, 3);
     responseBody.writeInt16BE(0, 5);
     responseBody.writeInt16BE(4, 7);
