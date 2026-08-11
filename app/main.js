@@ -128,6 +128,41 @@ const getLogDirectories = () => {
   return dirs.length > 0 ? dirs : fallback.filter((dir) => fs.existsSync(dir));
 };
 
+const getKnownTopicUuids = () => {
+  const knownUuids = new Set();
+
+  for (const logDir of getLogDirectories()) {
+    if (!fs.existsSync(logDir)) {
+      continue;
+    }
+
+    for (const entry of fs.readdirSync(logDir, { withFileTypes: true })) {
+      if (!entry.isDirectory()) {
+        continue;
+      }
+
+      const metadataPath = path.join(logDir, entry.name, "partition.metadata");
+      if (!fs.existsSync(metadataPath)) {
+        continue;
+      }
+
+      const metadata = fs.readFileSync(metadataPath, "utf8");
+      for (const line of metadata.split(/\r?\n/)) {
+        if (!line.startsWith("topic_id:")) {
+          continue;
+        }
+
+        const uuid = decodeBase64Uuid(line.slice("topic_id:".length).trim());
+        if (uuid) {
+          knownUuids.add(uuid);
+        }
+      }
+    }
+  }
+
+  return knownUuids;
+};
+
 const getTopicUuid = (topicName) => {
   if (!topicName) {
     return null;
@@ -377,27 +412,33 @@ const server = net.createServer((connection) => {
             writeUnsignedVarint(0),
           ]);
         } else {
-          const firstTopic = topics[0];
-          const topicUuid = firstTopic.topicUuid || "00000000-0000-0000-0000-000000000000";
-          const partitionId = firstTopic.partitionId ?? 0;
+          const knownTopicUuids = getKnownTopicUuids();
+          const topicResponses = topics.map(({ topicUuid, partitionId }) => {
+            const uuid = topicUuid || "00000000-0000-0000-0000-000000000000";
+            const partitionErrorCode = knownTopicUuids.has(uuid) ? 0 : 100;
+
+            return Buffer.concat([
+              writeUuid(uuid),
+              writeUnsignedVarint(2),
+              writeInt32(partitionId ?? 0),
+              writeInt16(partitionErrorCode),
+              writeInt64(-1),
+              writeInt64(-1),
+              writeInt64(-1),
+              writeUnsignedVarint(1),
+              writeInt32(-1),
+              writeUnsignedVarint(1),
+              writeUnsignedVarint(0),
+              writeUnsignedVarint(0),
+            ]);
+          });
 
           responseBody = Buffer.concat([
             writeInt32(0),
             writeInt16(0),
             writeInt32(0),
-            writeUnsignedVarint(2),
-            writeUuid(topicUuid),
-            writeUnsignedVarint(2),
-            writeInt32(partitionId),
-            writeInt16(100),
-            writeInt64(-1),
-            writeInt64(-1),
-            writeInt64(-1),
-            writeUnsignedVarint(1),
-            writeInt32(-1),
-            writeUnsignedVarint(1),
-            writeUnsignedVarint(0),
-            writeUnsignedVarint(0),
+            writeUnsignedVarint(topics.length + 1),
+            ...topicResponses,
             writeUnsignedVarint(0),
           ]);
         }
