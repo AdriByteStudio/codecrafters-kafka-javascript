@@ -19,10 +19,20 @@ const server = net.createServer((connection) => {
     const correlationId = buffer.readInt32BE(8);
     const errorCode = requestApiVersion >= 0 && requestApiVersion <= 4 ? 0 : 35;
 
-    const response = Buffer.alloc(10);
-    response.writeInt32BE(0, 0);
+    const responseBody = Buffer.alloc(15);
+    responseBody.writeInt16BE(errorCode, 0);
+    responseBody.writeInt8(1, 2);
+    responseBody.writeInt16BE(18, 3);
+    responseBody.writeInt16BE(0, 5);
+    responseBody.writeInt16BE(4, 7);
+    responseBody.writeInt8(0, 9);
+    responseBody.writeInt32BE(0, 10);
+    responseBody.writeInt8(0, 14);
+
+    const response = Buffer.alloc(4 + 4 + responseBody.length);
+    response.writeInt32BE(4 + responseBody.length, 0);
     response.writeInt32BE(correlationId, 4);
-    response.writeInt16BE(errorCode, 8);
+    responseBody.copy(response, 8);
 
     connection.end(response);
   });
