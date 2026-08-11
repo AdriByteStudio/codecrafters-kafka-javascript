@@ -207,6 +207,50 @@ const encodePartition = (partitionIndex) => Buffer.concat([
   writeUnsignedVarint(0),
 ]);
 
+const parseDescribeTopicPartitionsRequest = (request, offset) => {
+  const topicNames = [];
+
+  if (offset >= request.length) {
+    return { topicNames, offset };
+  }
+
+  const { value: topicsArrayLength, bytesRead } = readUnsignedVarint(request, offset);
+  offset += bytesRead;
+
+  if (topicsArrayLength > 0) {
+    const topicCount = topicsArrayLength === 1 ? 0 : topicsArrayLength - 1;
+    for (let i = 0; i < topicCount; i += 1) {
+      const { value: topicName, offset: nextOffset } = readCompactString(request, offset);
+      topicNames.push(topicName ?? "");
+      offset = nextOffset;
+
+      if (offset < request.length) {
+        const { value: tag, bytesRead: tagBytes } = readUnsignedVarint(request, offset);
+        if (tag === 0) {
+          offset += tagBytes;
+        }
+      }
+    }
+  }
+
+  if (offset + 4 <= request.length) {
+    offset += 4;
+  }
+
+  if (offset < request.length) {
+    offset += 1;
+  }
+
+  if (offset < request.length) {
+    const { value: tag, bytesRead: tagBytes } = readUnsignedVarint(request, offset);
+    if (tag === 0) {
+      offset += tagBytes;
+    }
+  }
+
+  return { topicNames, offset };
+};
+
 const server = net.createServer((connection) => {
   let buffer = Buffer.alloc(0);
 
@@ -277,49 +321,46 @@ const server = net.createServer((connection) => {
 
         responseBody = Buffer.concat(responseParts);
       } else if (requestApiKey === 75) {
-        let topicName = "";
-        if (offset < request.length) {
-          const { value: topicsArrayLength, bytesRead } = readUnsignedVarint(request, offset);
-          offset += bytesRead;
-          if (topicsArrayLength > 0 && offset < request.length) {
-            const { value: parsedTopicName } = readCompactString(request, offset);
-            topicName = parsedTopicName ?? "";
-          }
-        }
+        const { topicNames } = parseDescribeTopicPartitionsRequest(request, offset);
+        const requestedTopics = [...topicNames].filter(Boolean).sort((left, right) => left.localeCompare(right));
 
-        console.error("DTP_DEBUG", { requestHex: request.toString("hex"), offset, topicName, topicUuidValue: getTopicUuid(topicName) });
+        const topicResponses = requestedTopics.map((topicName) => {
+          const topicUuidValue = getTopicUuid(topicName);
+          const topicUuid = topicUuidValue ? writeUuid(topicUuidValue) : Buffer.alloc(16);
+          const topicErrorCode = topicUuidValue ? 0 : 3;
+          const partitions = getTopicPartitions(topicName);
 
-        const topicUuidValue = getTopicUuid(topicName);
-        const topicUuid = topicUuidValue ? writeUuid(topicUuidValue) : Buffer.alloc(16);
-        const topicErrorCode = topicUuidValue ? 0 : 3;
-        const partitions = getTopicPartitions(topicName);
+          const partitionResponses = partitions.map((partitionIndex) => Buffer.concat([
+            writeInt16(0),
+            writeInt32(partitionIndex),
+            writeInt32(1),
+            writeInt32(0),
+            writeUnsignedVarint(2),
+            writeInt32(1),
+            writeUnsignedVarint(2),
+            writeInt32(1),
+            writeUnsignedVarint(1),
+            writeUnsignedVarint(1),
+            writeUnsignedVarint(1),
+            writeUnsignedVarint(0),
+          ]));
 
-        const partitionResponses = partitions.map((partitionIndex) => Buffer.concat([
-          writeInt16(0),
-          writeInt32(partitionIndex),
-          writeInt32(1),
-          writeInt32(0),
-          writeUnsignedVarint(2),
-          writeInt32(1),
-          writeUnsignedVarint(2),
-          writeInt32(1),
-          writeUnsignedVarint(1),
-          writeUnsignedVarint(1),
-          writeUnsignedVarint(1),
-          writeUnsignedVarint(0),
-        ]));
+          return Buffer.concat([
+            writeInt16(topicErrorCode),
+            writeCompactString(topicName),
+            topicUuid,
+            writeBool(false),
+            writeUnsignedVarint(partitions.length === 0 ? 1 : partitions.length + 1),
+            ...partitionResponses,
+            writeInt32(0),
+            writeUnsignedVarint(0),
+          ]);
+        });
 
         responseBody = Buffer.concat([
           writeInt32(0),
-          writeUnsignedVarint(2),
-          writeInt16(topicErrorCode),
-          writeCompactString(topicName),
-          topicUuid,
-          writeBool(false),
-          writeUnsignedVarint(partitions.length === 0 ? 1 : partitions.length + 1),
-          ...partitionResponses,
-          writeInt32(3576),
-          writeUnsignedVarint(0),
+          writeUnsignedVarint(requestedTopics.length === 0 ? 1 : requestedTopics.length + 1),
+          ...topicResponses,
           writeInt8(-1),
           writeUnsignedVarint(0),
         ]);
