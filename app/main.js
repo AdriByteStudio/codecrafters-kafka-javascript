@@ -329,6 +329,87 @@ const readUuid = (buffer, offset) => {
   return { value: uuid, offset: offset + 16 };
 };
 
+const writeString = (value) => {
+  const bytes = Buffer.from(value ?? "", "utf8");
+  return Buffer.concat([writeInt16(bytes.length), bytes]);
+};
+
+const readString = (buffer, offset) => {
+  if (offset + 2 > buffer.length) {
+    return { value: "", offset };
+  }
+
+  const length = buffer.readInt16BE(offset);
+  const start = offset + 2;
+  const end = start + length;
+
+  return {
+    value: buffer.toString("utf8", start, end),
+    offset: end,
+  };
+};
+
+const parseProduceRequest = (request, offset) => {
+  let cursor = offset;
+
+  const { value: transactionalId, offset: afterTransactionalId } = readCompactString(request, cursor);
+  cursor = afterTransactionalId;
+
+  const acks = request.readInt16BE(cursor);
+  cursor += 2;
+
+  cursor += 4;
+
+  const { value: topicsArrayLength, bytesRead: topicsArrayBytesRead } = readUnsignedVarint(request, cursor);
+  cursor += topicsArrayBytesRead;
+
+  const topicCount = topicsArrayLength === 0 ? 0 : topicsArrayLength - 1;
+  let topicName = "";
+  let partitionIndex = -1;
+
+  for (let i = 0; i < topicCount; i += 1) {
+    const { value: currentTopicName, offset: afterTopicName } = readCompactString(request, cursor);
+    cursor = afterTopicName;
+    topicName = currentTopicName ?? "";
+
+    const { value: partitionsArrayLength, bytesRead: partitionsArrayBytesRead } = readUnsignedVarint(request, cursor);
+    cursor += partitionsArrayBytesRead;
+
+    const partitionCount = partitionsArrayLength === 0 ? 0 : partitionsArrayLength - 1;
+    for (let j = 0; j < partitionCount; j += 1) {
+      partitionIndex = request.readInt32BE(cursor);
+      cursor += 4;
+
+      const { value: recordBatchesSize, bytesRead: recordBatchesSizeBytes } = readUnsignedVarint(request, cursor);
+      cursor += recordBatchesSizeBytes;
+      cursor += recordBatchesSize;
+
+      if (cursor < request.length) {
+        const { value: tag, bytesRead } = readUnsignedVarint(request, cursor);
+        if (tag === 0) {
+          cursor += bytesRead;
+        }
+      }
+    }
+
+    if (cursor < request.length) {
+      const { value: tag, bytesRead } = readUnsignedVarint(request, cursor);
+      if (tag === 0) {
+        cursor += bytesRead;
+      }
+    }
+  }
+
+  if (cursor < request.length) {
+    const { value: tag, bytesRead } = readUnsignedVarint(request, cursor);
+    if (tag === 0) {
+      cursor += bytesRead;
+    }
+  }
+
+  return { topicName, partitionIndex, offset: cursor, transactionalId, acks };
+};
+
 const parseFetchRequest = (request, offset) => {
   let cursor = offset;
 
@@ -464,7 +545,32 @@ const server = net.createServer((connection) => {
 
       let responseBody;
 
-      if (requestApiKey === 1) {
+      if (requestApiKey === 0) {
+        const { topicName, partitionIndex } = parseProduceRequest(request, offset);
+
+        const topicResponse = Buffer.concat([
+          writeCompactString(topicName || ""),
+          writeUnsignedVarint(2),
+          Buffer.concat([
+            writeInt32(partitionIndex),
+            writeInt16(3),
+            writeInt64(-1),
+            writeInt64(-1),
+            writeInt64(-1),
+            writeUnsignedVarint(1),
+            writeUnsignedVarint(0),
+            writeUnsignedVarint(0),
+          ]),
+          writeUnsignedVarint(0),
+        ]);
+
+        responseBody = Buffer.concat([
+          writeUnsignedVarint(2),
+          topicResponse,
+          writeInt32(0),
+          writeUnsignedVarint(0),
+        ]);
+      } else if (requestApiKey === 1) {
         const { topics } = parseFetchRequest(request, offset);
 
         if (topics.length === 0) {
@@ -592,7 +698,7 @@ const server = net.createServer((connection) => {
         responseBody = Buffer.alloc(0);
       }
 
-      const responseHeader = [1, 75].includes(requestApiKey)
+      const responseHeader = [0, 1, 75].includes(requestApiKey)
         ? Buffer.concat([writeInt32(correlationId), writeUnsignedVarint(0)])
         : writeInt32(correlationId);
 
